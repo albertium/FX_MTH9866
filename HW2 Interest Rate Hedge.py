@@ -58,7 +58,7 @@ def hedge(hedger, N, dt, T: list, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho
         weights = np.array([1, -N1, -N2])  # T forward hedged by shorting N1 and N2 T1 and T2 forwards
         hedged_return = np.matmul(weights, forward_return)
         hedged_std.append([np.std(hedged_return)])  # hedging error
-      return np.array(hedged_std)
+    return np.array(hedged_std)
 
 
 if __name__ == '__main__':
