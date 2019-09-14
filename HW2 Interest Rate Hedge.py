@@ -4,46 +4,60 @@ import itertools
 
 
 def simulate(N, dt, T, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho):
+    """
+    generate forward returns for T, T1 and T2 per 2 factor model
+    """
     motions = np.random.normal(0, np.sqrt(dt), (2, N))
-    motions[1] = rho * motions[0] + np.sqrt(1 - rho * rho) * motions[1]
+    motions[1] = rho * motions[0] + np.sqrt(1 - rho * rho) * motions[1]  # introduce correlation
+    # coefficients of the Brownian motions for each tenor
     coefs = np.array([[sig1 * np.exp(-beta1 * t), sig2 * np.exp(-beta2 * t)] for t in [T, T1, T2]])
     dQs = np.matmul(coefs, motions)
     Ts = np.array([T, T1, T2]).reshape(-1, 1)
-    return spot * np.exp(-(Q + dQs) * Ts) - np.exp(-Q * Ts)  # forward contract change
+    return spot * np.exp(-(Q + dQs) * Ts) - np.exp(-Q * Ts)  # forward return
 
 
 def get_no_hedge(T, T1, T2, Q, sig1, sig2, beta1, beta2, rho):
-    return 0, 0
+    return 0, 0  # no hedge
 
 
 def get_triangle_hedge(T, T1, T2, Q, sig1, sig2, beta1, beta2, rho):
     if T < T1:
-        ratio = 1
+        ratio = 1  # flat for regions < T1
     elif T > T2:
-        ratio = 0
+        ratio = 0  # flat for regions > T2
     else:
         ratio = (T2 - T) / (T2 - T1)
     return ratio * T / T1 * np.exp(-Q * (T - T1)), (1 - ratio) * T / T2 * np.exp(-Q * (T - T2))
 
 
 def get_factor_hedge(T, T1, T2, Q, sig1, sig2, beta1, beta2, rho):
+    """
+    return hedge amount using factor model
+    """
+    # partial derivatives of forward T, T1, T2 with respective to interest rate Q, Q1, Q2
     V_Q = np.array([[t * np.exp(-Q * t) for t in [T, T1, T2]]])
+    # partial derivatives of interest rate Q, Q1, Q2 with respective to Brownian motion z1, z2
     Q_z = np.array([r1 * sig1 * np.exp(-beta1 * t) + r2 * sig2 * np.exp(-beta2 * t)
                     for t, (r1, r2) in itertools.product([T, T1, T2], [[1, rho], [rho, 1]])]).reshape(-1, 2).T
-    A = V_Q[:, 1:] * Q_z[:, 1:]
-    b = V_Q[:, 0] * Q_z[:, 0]
+    A = V_Q[:, 1:] * Q_z[:, 1:]  # partial derivative of forward T1, T2 with respective to z1, z2
+    b = V_Q[:, 0] * Q_z[:, 0]  # partial derivative of forward T with respective to z1, z2
+    # partial derivatives of whole portfolio (with weights 1, -N1, -N2) with respective to z1, z2 should be 0
+    # using this relationship, solve for N1, N2
     hedges = np.linalg.solve(A, b)
     return hedges[0], hedges[1]
 
 
 def hedge(hedger, N, dt, T: list, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho):
+    """
+    get forward returns for T, T1, T2 and apply hedging per returned from hedger
+    """
     hedged_std = []
     for t in T:
         forward_return = simulate(N, dt, t, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho)
         N1, N2 = hedger(t, T1, T2, Q, sig1, sig2, beta1, beta2, rho)
-        weights = np.array([1, -N1, -N2])
+        weights = np.array([1, -N1, -N2])  # T forward hedged by shorting N1 and N2 T1 and T2 forwards
         hedged_return = np.matmul(weights, forward_return)
-        hedged_std.append([np.std(hedged_return)])
+        hedged_std.append([np.std(hedged_return)])  # hedging error
     print()
     return np.array(hedged_std)
 
@@ -61,17 +75,8 @@ if __name__ == '__main__':
     beta2 = 0.1
     rho = -0.4
 
-    # sanity check
-    # fwd_ret = simulate(N, dt, 0.1, 0.25, 1, spot, Q, sig1, sig2, beta1, beta2, rho)
-    # print(np.std(fwd_ret, axis=1))  # standard deviation of simulated forward return
-    # Ts = np.array([0.1, 0.25, 1])
-    # coef1 = sig1 * np.exp(-beta1 * Ts)
-    # coef2 = sig2 * np.exp(-beta2 * Ts)
-    # # theoretical standard deviation of simulated forward return
-    # print(np.exp(-Q * Ts) * np.sqrt(coef1 ** 2 + coef2 ** 2 + 2 * rho * coef1 * coef2) * np.sqrt(dt) * Ts)
-
-    # run hedging
-    Ts = [0.1, 0.25, 0.5, 0.75, 1, 2]
+    # run hedging with the 3 hedgers
+    Ts = [0.1, 0.25, 0.5, 0.75, 1, 2]  # forward tenors
     results = []
     for hedger in [get_no_hedge, get_triangle_hedge, get_factor_hedge]:
         results.append(hedge(hedger, N, dt, Ts, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho))
