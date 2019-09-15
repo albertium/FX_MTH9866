@@ -47,6 +47,29 @@ def get_factor_hedge(T, T1, T2, Q, sig1, sig2, beta1, beta2, rho):
     return hedges[0], hedges[1]
 
 
+def get_pca_hedge(T, T1, T2, Q, sig1, sig2, beta1, beta2, rho):
+    """
+    just for fun. return hedges using PCA method
+    """
+    # simulate forward return as "historical data" for covariance calculation
+    Ts = [0.1, 0.25, 0.5, 0.75, 1, 2]
+    motions = np.random.normal(0, np.sqrt(dt), (2, N))
+    motions[1] = rho * motions[0] + np.sqrt(1 - rho * rho) * motions[1]  # introduce correlation
+    # coefficients of the Brownian motions for each tenor
+    coefs = np.array([[sig1 * np.exp(-beta1 * t), sig2 * np.exp(-beta2 * t)] for t in Ts])
+    dQs = np.matmul(coefs, motions)
+
+    # follow the same procedure as in factor hedging. But use factor loadings instead for Q's sensitivity to z's
+    cov = np.cov(dQs)
+    _, loadings = np.linalg.eig(cov)
+    V_Q = np.array([[t * np.exp(-Q * t) for t in [T, T1, T2]]])
+    Q_z = loadings[[Ts.index(t) for t in [T, T1, T2]], :2].T  # find the factor loadings for corresponding tenors
+    A = V_Q[:, 1:] * Q_z[:, 1:]
+    b = V_Q[:, 0] * Q_z[:, 0]
+    hedges = np.linalg.solve(A, b)
+    return hedges[0], hedges[1]
+
+
 def hedge(hedger, N, dt, T: list, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho):
     """
     get forward returns for T, T1, T2 and apply hedging per returned from hedger
@@ -77,12 +100,16 @@ if __name__ == '__main__':
     # run hedging with the 3 hedgers
     Ts = [0.1, 0.25, 0.5, 0.75, 1, 2]  # forward tenors
     results = []
-    for hedger in [get_no_hedge, get_triangle_hedge, get_factor_hedge]:
+    # include PCA just for fun
+    for hedger in [get_no_hedge, get_triangle_hedge, get_factor_hedge, get_pca_hedge]:
         results.append(hedge(hedger, N, dt, Ts, T1, T2, spot, Q, sig1, sig2, beta1, beta2, rho))
 
     results = np.hstack(results)
-    print(f'{"Tenor":<8}{"No Hedge":<12}{"Triangle":<12}{"Triangle %":<12}{"Factor":<12}{"Factor %":<12}')
+    print(f'{"Tenor":<8}|{"No Hedge":<12}{"Triangle":<12}{"Triangle %":<12}{"Factor":<12}{"Factor %":<12}'
+          f'{"PCA":<12}{"PCA %":<12}')
+    print('--------|-------------------------------------------------------------------------------')
     for tenor, data in zip(Ts, results):
-        print(f'{tenor:<8.2f}{data[0] * 1e4:<12.3f}'
+        print(f'{tenor:<8.2f}|{data[0] * 1e4:<12.3f}'
               f'{data[1] * 1e4:<12.3f}{1 - data[1] / data[0]:<12.1%}'  # triangle stats
-              f'{data[2] * 1e4:<12.3f}{1 - data[2] / data[0]:<12.1%}')  # factor model stats
+              f'{data[2] * 1e4:<12.3f}{1 - data[2] / data[0]:<12.1%}'  # factor model stats
+              f'{data[3] * 1e4:<12.3f}{1 - data[3] / data[0]:<12.1%}')  # PCA model stats
