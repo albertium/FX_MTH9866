@@ -1,6 +1,5 @@
 
 import numpy as np
-from scipy import sparse
 from scipy.stats import norm
 import matplotlib.pyplot as plt
 plt.style.use('seaborn-whitegrid')
@@ -88,7 +87,7 @@ class FXVolSmile:
         coefs = np.linalg.solve(A, b)
         return coefs.reshape(-1, 4)
 
-    def evaluate(self, x):
+    def volatility(self, x):
         idx = np.minimum(np.maximum(np.searchsorted(self.xs, x) - 1, 0), self.N - 1)
         x = np.minimum(np.maximum(x, self.xs[0]), self.xs[-1])
         coef = self.coefs[idx]
@@ -107,6 +106,6 @@ if __name__ == '__main__':
     fig = plt.figure()
     ax = plt.axes()
     xs = np.linspace(K_min, K_max, 1000)
-    ax.plot(xs, smile.evaluate(xs))
-    ax.plot(xs, smile2.evaluate(xs))
+    ax.plot(xs, smile.volatility(xs))
+    ax.plot(xs, smile2.volatility(xs))
     plt.show()
