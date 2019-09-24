@@ -51,6 +51,7 @@ class FXVolSmile:
         return (self.spot + self.ff) * np.exp(Q)
 
     def get_spline_coefficients(self):
+        # for solving for coefficients with Ax = b
         A = np.zeros((self.N * 4, self.N * 4))
         b = np.zeros(self.N * 4)
 
@@ -88,8 +89,8 @@ class FXVolSmile:
         return coefs.reshape(-1, 4)
 
     def volatility(self, x):
-        idx = np.minimum(np.maximum(np.searchsorted(self.xs, x) - 1, 0), self.N - 1)
-        x = np.minimum(np.maximum(x, self.xs[0]), self.xs[-1])
+        x = np.minimum(np.maximum(x, self.xs[0]), self.xs[-1])  # vol is constant outside the boundary
+        idx = np.maximum(np.searchsorted(self.xs, x) - 1, 0)
         coef = self.coefs[idx]
         return np.sum(coef * np.array([np.power(x, p) for p in [0, 1, 2, 3]]).T, axis=1)
 
