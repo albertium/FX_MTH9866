@@ -125,18 +125,23 @@ def merge_data(crsp, compustat):
     return filled
 
 
-def backtest(panel, strategy):
+def backtest(panel):
     start_year = panel.year.min()
     end_year = panel.year.max()
 
     positions = {}
     equity = []
     for year in range(start_year, end_year + 1):
-        curr_data = panel[panel.year == year]
+        curr_data = panel[panel.year == year].set_index('PERMNO')
 
         # calculate return
         portfolio_return = [curr_data.loc[no].RET * weight for no, weight in positions.items() if no in curr_data.index]
         equity.append(np.sum(portfolio_return))
 
         # rebalance
-        positions = {}
+        bucket = pd.qcut(curr_data.tacc, 10, range(10))
+        longs = curr_data[bucket == 0].index.values
+        shorts = curr_data[bucket == 9].index.values
+        positions = {**dict.fromkeys(longs, 0.5 / len(longs)), **dict.fromkeys(shorts, -0.5 / len(shorts))}
+
+    return equity
