@@ -1,6 +1,7 @@
 
 import pandas as pd
 import numpy as np
+from pandas.tseries.offsets import MonthEnd
 
 
 def process_crsp(filename, year_end=12):
@@ -47,27 +48,96 @@ def process_crsp(filename, year_end=12):
     return data
 
 
-def process_compustat(filename, year_end=12):
-    fund = pd.read_csv(filename, compression='gzip', parse_dates=['datadate'], infer_datetime_format='%Y%m%d',
-                       dtype={'LPERMNO': str}).rename({'LPERMNO': 'PERMNO', 'datadate': 'date'}, axis=1)
+def process_crsp2(filename):
+    data = pd.read_feather(filename)
+    data['share'] = data['shrout'] * data['cfacshr'] * 1e3
+    data['price'] = data['prc'].abs() / data['cfacpr']
+    data['cap'] = data.price * data.share / 1e6
 
+    columns_kept = ['date', 'permno', 'siccd', 'ret', 'cap']
+    tota_rows = data.shape[0]
+    print(f'Total rows: {tota_rows}')
+    print(f'{data.date.min()} to {data.date.max()}')
+
+    print('Check missing')
+    for col in columns_kept:
+        count = data[col].isna().sum()
+        print(f'    {col} missing: {count} ({count / tota_rows:.2%})')
+
+    data = data[columns_kept].dropna()
+    print(f'Remove NAs: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    data = data[(data.siccd < 6000) | (data.siccd > 6999)]  # remove financial
+    print(f'Remove financials: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    dup = data[['permno', 'date']].duplicated().sum()
+    print(f'Duplicated for key [permno, date]: {dup}')
+
+    data.permno = data.permno.astype(int)
+    data['date'] = pd.to_datetime(data['date'])
+    data['join_date'] = data.date + MonthEnd(0)
+    # data['next_join_date'] = data.join_date + MonthEnd(1)
+
+    # tmp = data[['permno', 'join_date', 'ret']].rename({'ret': 'next_ret', 'join_date': 'next_join_date'}, axis=1)
+    # data = pd.merge(data, tmp, on=['permno', 'next_join_date'])
+    data = data.dropna()
+    # print(f'After next return: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    # return data[['permno', 'join_date', 'ret', 'next_ret', 'cap']]
+    return data[['permno', 'join_date', 'ret', 'cap']]
+
+
+def process_crsp3(filename,year_end=6):
+    """
+    For June Split
+    """
+    data = pd.read_feather(filename)
+    data['share'] = data['shrout'] * data['cfacshr'] * 1e3
+    data['price'] = data['prc'].abs() / data['cfacpr']
+    data['cap'] = data.price * data.share / 1e6
+
+    columns_kept = ['date', 'permno', 'siccd', 'ret', 'cap']
+    tota_rows = data.shape[0]
+    print(f'Total rows: {tota_rows}')
+    print(f'{data.date.min()} to {data.date.max()}')
+
+    print('Check missing')
+    for col in columns_kept:
+        count = data[col].isna().sum()
+        print(f'    {col} missing: {count} ({count / tota_rows:.2%})')
+
+    data = data[columns_kept].dropna()
+    print(f'Remove NAs: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    data = data[(data.siccd < 6000) | (data.siccd > 6999)]  # remove financial
+    print(f'Remove financials: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    dup = data[['permno', 'date']].duplicated().sum()
+    print(f'Duplicated for key [permno, date]: {dup}')
+
+    data.permno = data.permno.astype(int)
+    data['date'] = pd.to_datetime(data['date'])
+    data['year'] = data.date.dt.year - (data.date.dt.month <= (year_end % 12))
+    return data[['permno', 'year', 'date', 'ret', 'cap']].sort_values(['permno', 'date'])
+
+
+def process_compustat(filename, year_end=12):
+    # fund = pd.read_csv(filename, compression='gzip', parse_dates=['datadate'], infer_datetime_format='%Y%m%d',
+    #                    dtype={'LPERMNO': 'int'}).rename({'LPERMNO': 'permno', 'datadate': 'date'}, axis=1)
+
+    fund = pd.read_feather(filename)
     total = fund.shape[0]
     print(f'Total rows: {total}')
     print(f'{fund.date.min()} to {fund.date.max()}')
 
-    required_cols = ['act', 'at', 'che', 'dlc', 'dltt', 'ivao', 'ivst', 'lct', 'lt', 'oiadp', 'pstk']
-    critical_cols = ['at', 'che', 'act', 'lct', 'lt', 'oiadp']
-    fund = fund[['PERMNO', 'date', 'fyear'] + required_cols].dropna(how='any', subset=critical_cols)
+    required_cols = ['act', 'at', 'che', 'dlc', 'dltt', 'ivao', 'ivst', 'lct', 'lt', 'oiadp', 'pstk', 'sale']
+    critical_cols = ['at', 'che', 'act', 'lct', 'lt', 'sale']
+    fund = fund[['permno', 'date'] + required_cols].dropna(how='any', subset=critical_cols)
     fund = fund.fillna({'dltt': 0, 'dlc': 0, 'pstk': 0, 'ivst': 0, 'ivao': 0})
     print(f'Drop NAs: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
 
-    dup = fund[['PERMNO', 'fyear']].duplicated().sum()
-    print(f'Duplicated PERMNO fyear: {dup}')
-
-    fund.drop_duplicates(subset=['PERMNO', 'fyear'], keep='last', inplace=True)
-    print(f'Drop duplicates: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
-    dup = fund[['PERMNO', 'fyear']].duplicated().sum()
-    print(f'Duplicated PERMNO fyear: {dup}')
+    dup = fund[['permno', 'date']].duplicated().sum()
+    print(f'Duplicated permno date: {dup}')
 
     zero = (fund["at"] == 0).sum()
     print(f'Zero total asset: {zero}')
@@ -85,21 +155,24 @@ def process_compustat(filename, year_end=12):
     fund['finl'] = fund.dltt + fund.dlc + fund.pstk
     fund['fin'] = fund.fina - fund.finl
 
-    fund['fyear1'] = fund.fyear.shift()
-    fund = fund.merge(fund, left_on=['PERMNO', 'fyear1'], right_on=['PERMNO', 'fyear'], how='left',
-                      suffixes=('', '1')).dropna()
-    print(f'Merged with previous fyear: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+    fund = fund.sort_values(['permno', 'date'])
+    cols = ['at', 'wc', 'nco', 'fin', 'sale']  # sale is not used but is required in data cleaning
+    prev_cols = ['prev_' + x for x in cols]
+    fund[prev_cols] = fund.groupby('permno', as_index=False)[cols].shift()
+    fund.dropna(inplace=True)
+    print(f'Merged with previous total asset: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
 
     # delta metrics
-    fund['avg_at'] = (fund['at'] + fund['at1']) / 2
+    fund['avg_at'] = (fund['at'] + fund['prev_at']) / 2
     fund['roa'] = fund.oiadp / fund.avg_at
-    fund['dwc'] = (fund.wc - fund.wc1) / fund.avg_at
-    fund['dnco'] = (fund.nco - fund.nco1) / fund.avg_at
-    fund['dfin'] = (fund.fin - fund.fin1) / fund.avg_at
+    fund['dwc'] = (fund.wc - fund.prev_wc) / fund.avg_at
+    fund['dnco'] = (fund.nco - fund.prev_nco) / fund.avg_at
+    fund['dnoa'] = fund['dwc'] + fund['dnco']
+    fund['dfin'] = (fund.fin - fund.prev_fin) / fund.avg_at
     fund['tacc'] = fund.dwc + fund.dnco + fund.dfin
-    fund.drop([col for col in fund.columns if '1' in col], axis=1, inplace=True)
+    fund.drop([col for col in fund.columns if 'prev_' in col], axis=1, inplace=True)
     fund['year'] = fund.date.dt.year - (fund.date.dt.month <= (year_end % 12))
-    fund = fund.groupby(['PERMNO', 'year'], as_index=False).last()
+    fund['join_date'] = fund.date + MonthEnd(0)
 
     print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
     return fund
