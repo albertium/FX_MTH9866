@@ -2,6 +2,84 @@
 import pandas as pd
 import numpy as np
 from pandas.tseries.offsets import MonthEnd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+def df_range(df, start_date, end_date):
+    return df[(df.date >= start_date) & (df.date <= end_date)]
+
+
+def df_semi_minus(df1, df2, left, right=None):
+    if right is None:
+        right = left
+
+    df2 = df2[right].copy()
+    df2['_flag_'] = 1
+    joined = pd.merge(df1, df2, left_on=left, right_on=right, how='left', suffixes=('', '_y'))
+    joined = joined[joined['_flag_'].isna()]
+    return joined.drop([col for col in joined.columns if col.endswith('_y')] + ['_flag_'], axis=1)
+
+
+def join_crsp_and_funda(crsp, funda):
+    crsp['year_p'] = crsp.year - 1
+    joined = pd.merge(crsp, funda, left_on=['permno', 'year_p'], right_on=['permno', 'fyear'], how='inner')
+    print(f'CRSP recrods: {crsp.shape[0]}')
+    print(f'Merged recrods: {joined.shape[0]} ({joined.shape[0] / crsp.shape[0]:.2%})')
+    return joined
+
+
+def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10):
+    cut_idx = list(range(n_cuts))
+    df['equal'] = 1
+    for signal in signals:
+        df[signal + '_r'] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
+
+    results = []
+    df['scaled_ret'] = df[weight_col] * df[ret_col]
+    for rank in [x + '_r' for x in signals]:
+        port_ret = df.groupby([rank, time_col], as_index=False).agg({'scaled_ret': 'sum', weight_col: 'sum'})
+        port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
+
+        port_ret = port_ret.pivot(index=time_col, columns=rank, values='wgt_ret').reset_index()
+        port_ret['hedged'] = port_ret[0] - port_ret[9]
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Bar(y=port_ret.hedged, x=port_ret.year, name='Annual Return'), secondary_y=False)
+        fig.add_trace(go.Scatter(y=(1 + port_ret.hedged).cumprod(), x=port_ret.year, name='Equity'), secondary_y=True)
+        fig.show()
+        results.append(port_ret)
+
+    return results
+
+
+def get_funda_data(conn, items):
+    comp = conn.raw_sql(f"""
+        select gvkey, datadate as date, fyear, cusip, sich, seq, 
+        {items}
+        from comp.funda
+        where indfmt='INDL' 
+        and datafmt='STD'
+        and popsrc='D'
+        and consol='C'
+        and datadate >= '01/01/1960'
+    """)
+
+    ccm = conn.raw_sql("""
+        select gvkey, lpermno as permno, linkdt, linkenddt
+        from crsp.ccmxpf_linktable
+        where (linktype ='LU' or linktype='LC')
+    """)
+
+    print(f'comp records: {comp.shape[0]}')
+    print(f'ccm records: {ccm.shape[0]}')
+
+    comp['date'] = pd.to_datetime(comp.date)
+    ccm['linkdt'] = pd.to_datetime(ccm['linkdt'])
+    ccm['linkenddt'] = pd.to_datetime(ccm['linkenddt']).fillna(pd.to_datetime('today'))  # use today if missing
+    ccm1 = pd.merge(comp, ccm, how='left', on=['gvkey'])
+    final = ccm1[(ccm1.date >= ccm1.linkdt) & (ccm1.date <= ccm1.linkenddt)]
+    print(f'funda records: {final.shape[0]}')
+    return final.drop(['linkdt', 'linkenddt', 'gvkey'], axis=1)
 
 
 def process_crsp(filename, year_end=12):
@@ -87,7 +165,7 @@ def process_crsp2(filename):
     return data[['permno', 'join_date', 'ret', 'cap']]
 
 
-def process_crsp3(filename,year_end=6):
+def process_crsp_annual(filename,year_end=6):
     """
     For June Split
     """
@@ -118,7 +196,16 @@ def process_crsp3(filename,year_end=6):
     data.permno = data.permno.astype(int)
     data['date'] = pd.to_datetime(data['date'])
     data['year'] = data.date.dt.year - (data.date.dt.month <= (year_end % 12))
-    return data[['permno', 'year', 'date', 'ret', 'cap']].sort_values(['permno', 'date'])
+
+    # aggregate up to annually
+    data['rel'] = 1 + data.ret
+    data.sort_values(['permno', 'date'], inplace=True)  # so that first cap below is correct
+    data = data.groupby(['permno', 'year'], as_index=False).agg({'rel': 'prod', 'cap': 'first', 'siccd': 'first'})
+    data['ret'] = data.rel - 1
+    data['sic2'] = data.siccd.astype('str').str[:2]
+    data = data[['permno', 'sic2', 'year', 'ret', 'cap']].dropna()
+    print(f'Annual records: {data.shape[0]}')
+    return data
 
 
 def process_compustat(filename, year_end=12):
@@ -174,6 +261,148 @@ def process_compustat(filename, year_end=12):
     fund['year'] = fund.date.dt.year - (fund.date.dt.month <= (year_end % 12))
     fund['join_date'] = fund.date + MonthEnd(0)
 
+    print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+    return fund
+
+
+def process_compustat2(filename, year_end=12):
+    fund = pd.read_feather(filename)
+    total = fund.shape[0]
+    print(f'Total rows: {total}')
+    print(f'{fund.date.min()} to {fund.date.max()}')
+
+    # unique permno, fyear
+    fund = fund.sort_values(['permno', 'date'])
+    fund = fund.groupby(['permno', 'fyear'], as_index=False).last()  # use the latest for each fiscal year
+
+    critical_cols = ['at', 'che', 'act', 'lct', 'lt', 'sale']
+    other_cols = ['dlc', 'dltt', 'ivao', 'ivst', 'oiadp', 'pstk']
+    columns_kept = critical_cols + other_cols
+    fund = fund[['permno', 'fyear'] + columns_kept].dropna(how='any', subset=critical_cols)
+    fund = fund.fillna({'dltt': 0, 'dlc': 0, 'pstk': 0, 'ivst': 0, 'ivao': 0})
+    print(f'Drop NAs: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+
+    zero = (fund["at"] == 0).sum()
+    print(f'Zero total asset: {zero}')
+    fund = fund[fund['at'] != 0]
+    print(f'Drop zero AT: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+
+    # calculate metrics
+    fund['coa'] = fund.act - fund.che
+    fund['col'] = fund.lct - fund.dlc
+    fund['wc'] = fund.coa - fund.col
+    fund['ncoa'] = fund['at'] - fund.act - fund.ivao
+    fund['ncol'] = fund['lt'] - fund.lct - fund.dltt
+    fund['nco'] = fund.ncoa - fund.ncol
+    fund['fina'] = fund.ivst + fund.ivao
+    fund['finl'] = fund.dltt + fund.dlc + fund.pstk
+    fund['fin'] = fund.fina - fund.finl
+
+    cols = ['at', 'wc', 'nco', 'fin', 'sale']
+    fund['fyear_prev'] = fund.fyear - 1
+    join_keys = ['permno', 'fyear']
+    fund = pd.merge(fund, fund[join_keys + cols],
+                    left_on=['permno', 'fyear_prev'],
+                    right_on=join_keys,
+                    suffixes=['', '_prev'])
+    fund.dropna(inplace=True)
+    print(f'Merged with previous: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+
+    # delta metrics
+    fund['avg_at'] = (fund['at'] + fund['at_prev']) / 2
+    fund['roa'] = fund.oiadp / fund.avg_at
+    fund['dwc'] = (fund.wc - fund.wc_prev) / fund.avg_at
+    fund['dnco'] = (fund.nco - fund.nco_prev) / fund.avg_at
+    fund['dnoa'] = fund['dwc'] + fund['dnco']
+    fund['dfin'] = (fund.fin - fund.fin_prev) / fund.avg_at
+    fund['tacc'] = fund.dwc + fund.dnco + fund.dfin
+    fund.drop([col for col in fund.columns if col.endswith('_prev')], axis=1, inplace=True)
+    print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+    return fund
+
+
+def process_instruction(df, instruction: str):
+    [dest, formula] = [x.strip() for x in instruction.split('=')]
+
+
+def process_compustat_new(fund):
+    """
+    broad process function for compustat
+    """
+    # dataframe schema
+    required = ['at', 'che', 'act', 'lct', 'lt', 'sale']
+    defaults = ['dlc', 'dltt', 'ivao', 'ivst', 'oiadp', 'pstk']  # per sloan 2005
+    non_zeros = ['at']
+    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'oa', 'dacy', 'dac1', 'dac2', 'dac3']
+
+    total = fund.shape[0]
+    print(f'Total rows: {total}')
+    print(f'{fund.date.min()} to {fund.date.max()}')
+
+    # unique permno, fyear
+    fund = fund.sort_values(['permno', 'date'])
+    fund = fund.groupby(['permno', 'fyear'], as_index=False).last()  # use the latest for each fiscal year
+
+    # handle missing value
+    fund.dropna(how='any', subset=required, inplace=True)
+    fund = fund.fillna({col: 0 for col in defaults})
+    print(f'Handle NAs: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+
+    # force non-zero on specified columns
+    print('Check zeros')
+    for col in non_zeros:
+        zero = (fund[col] == 0).sum()
+        print(f'    {col} has zeros: {zero}')
+        fund = fund[fund[col] != 0]
+        print(f'    Drop {col} zeros: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+
+    # ========== Before Join ==========
+    # extended definition of accruals
+    fund['coa'] = fund.act - fund.che
+    fund['col'] = fund.lct - fund.dlc
+    fund['wc'] = fund.coa - fund.col
+    fund['ncoa'] = fund['at'] - fund.act - fund.ivao
+    fund['ncol'] = fund['lt'] - fund.lct - fund.dltt
+    fund['nco'] = fund.ncoa - fund.ncol
+    fund['fina'] = fund.ivst + fund.ivao
+    fund['finl'] = fund.dltt + fund.dlc + fund.pstk
+    fund['fin'] = fund.fina - fund.finl
+
+    # ========== Join ==========
+    # assume we always need some items from previous period
+    # TODO: automate this previou join step
+    join_keys = ['permno', 'fyear']
+    fund['fyear_p'] = fund.fyear - 1
+    fund = pd.merge(fund, fund, left_on=['permno', 'fyear_p'], right_on=join_keys, suffixes=['', '_p'])
+    # fund.dropna(inplace=True)
+    # print(f'After joining previous: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+
+    # ========== After Join ==========
+    # operating accruals
+    fund['dca'] = fund.act - fund.act_p
+    fund['dcash'] = fund.che - fund.che_p
+    fund['dcl'] = fund.lct - fund.lct_p
+    fund['dstd'] = fund.dlc - fund.dlc_p
+    fund['dtp'] = (fund.txp - fund.txp_p).fillna(0)  # set to 0 if missing
+    fund['oa'] = (fund.dca - fund.dcash) - (fund.dcl - fund.dstd - fund.dtp) - fund.dp
+
+    # DAC
+    fund['dsale'] = fund.sale - fund.sale_p
+    fund['drec'] = fund.rect - fund.rect_p
+    fund['dacy'] = fund.oa / fund.at_p
+    fund['dac1'] = 1 / fund.at_p
+    fund['dac2'] = (fund.dsale - fund.drec) / fund.at_p
+    fund['dac3'] = fund.ppegt / fund.at_p
+
+    # extended defintion of accruals
+    fund['avg_at'] = (fund['at'] + fund['at_p']) / 2
+    fund['dwc'] = (fund.wc - fund.wc_p) / fund.avg_at
+    fund['dnco'] = (fund.nco - fund.nco_p) / fund.avg_at
+    fund['dnoa'] = fund.dwc + fund.dnco
+    fund['dfin'] = (fund.fin - fund.fin_p) / fund.avg_at
+    fund['tacc'] = fund.dwc + fund.dnco + fund.dfin
+
+    fund = fund[['permno', 'fyear'] + keep].dropna()
     print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
     return fund
 
