@@ -29,6 +29,29 @@ def join_crsp_and_funda(crsp, funda):
     return joined
 
 
+def neutralize_alphas_and_returns(df, group_by, alphas):
+    def normalize(x):
+        normal = (x - x.mean()) / x.std()
+        return np.maximum(np.minimum(normal, 3), -3)
+
+    df = df.copy()
+    # neutralize alphas
+    df[[x + '_n' for x in alphas]] = df.groupby(group_by, as_index=False)[alphas].transform(normalize)
+
+    # neutralize returns
+    industry_rets = df.groupby(group_by, as_index=False).ret.mean()
+    df = pd.merge(df, industry_rets, on=group_by, suffixes=['', '_industry'])
+    df['adj_ret'] = df.ret - df.ret_industry
+    return df.dropna()
+
+
+def calculate_IC(df, time_col, alphas):
+    skip = len(alphas) + 1
+    ic = df.groupby(time_col)[alphas + ['adj_ret']].corr(method='spearman').iloc[(skip - 1)::skip]
+    ic = ic.reset_index().drop(['level_1', 'adj_ret'], axis=1)
+    return ic
+
+
 def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10):
     cut_idx = list(range(n_cuts))
     df['equal'] = 1
@@ -202,8 +225,10 @@ def process_crsp_annual(filename,year_end=6):
     data.sort_values(['permno', 'date'], inplace=True)  # so that first cap below is correct
     data = data.groupby(['permno', 'year'], as_index=False).agg({'rel': 'prod', 'cap': 'first', 'siccd': 'first'})
     data['ret'] = data.rel - 1
-    data['sic2'] = data.siccd.astype('str').str[:2]
-    data = data[['permno', 'sic2', 'year', 'ret', 'cap']].dropna()
+    data.siccd = data.siccd.astype('str').str.zfill(4)
+    data['sic1'] = data.siccd.str[:1]
+    data['sic2'] = data.siccd.str[:2]
+    data = data[['permno', 'sic1', 'sic2', 'year', 'ret', 'cap']].dropna()
     print(f'Annual records: {data.shape[0]}')
     return data
 
