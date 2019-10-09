@@ -1,7 +1,7 @@
 
 import pandas as pd
 import numpy as np
-from pandas.tseries.offsets import MonthEnd
+from pandas.tseries.offsets import MonthEnd, QuarterEnd, YearEnd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -21,9 +21,13 @@ def df_semi_minus(df1, df2, left, right=None):
     return joined.drop([col for col in joined.columns if col.endswith('_y')] + ['_flag_'], axis=1)
 
 
-def join_crsp_and_funda(crsp, funda):
-    crsp['year_p'] = crsp.year - 1
-    joined = pd.merge(crsp, funda, left_on=['permno', 'year_p'], right_on=['permno', 'fyear'], how='inner')
+def join_crsp_and_funda(crsp, funda, offset=QuarterEnd(2)):
+    crsp = crsp.copy()
+    crsp['time_idx_p'] = crsp['time_idx'] - offset
+    joined = pd.merge(crsp, funda, left_on=['permno', 'time_idx_p'], right_on=['permno', 'time_idx'],
+                      how='left', suffixes=('', '_d')).drop('time_idx_d', axis=1)
+    joined.sort_values(['permno', 'time_idx'], inplace=True)
+    joined = joined.groupby('permno', as_index=False).fillna(method='ffill').dropna()
     print(f'CRSP recrods: {crsp.shape[0]}')
     print(f'Merged recrods: {joined.shape[0]} ({joined.shape[0] / crsp.shape[0]:.2%})')
     return joined
@@ -65,12 +69,39 @@ def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight
         port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
 
         port_ret = port_ret.pivot(index=time_col, columns=rank, values='wgt_ret').reset_index()
-        port_ret['hedged'] = port_ret[0] - port_ret[9]
+        port_ret['hedged'] = (port_ret[0] - port_ret[9]) / 2  # make sure leverage is 1
+        port_ret['avg'] = port_ret.hedged.rolling(4, min_periods=4).sum()
         fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(y=port_ret.hedged, x=port_ret.year, name='Annual Return'), secondary_y=False)
-        fig.add_trace(go.Scatter(y=(1 + port_ret.hedged).cumprod(), x=port_ret.year, name='Equity'), secondary_y=True)
+        fig.add_trace(go.Bar(y=port_ret.avg, x=port_ret[time_col], name=rank), secondary_y=False)
+        fig.add_trace(go.Scatter(y=(1 + port_ret.hedged).cumprod(), x=port_ret[time_col], name='Equity'), secondary_y=True)
         fig.show()
         results.append(port_ret)
+
+    return results
+
+
+def calculate_excess_returns_by_buckets(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10):
+    cut_idx = list(range(n_cuts))
+    df['equal'] = 1
+    for signal in signals:
+        df[signal + '_r'] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
+
+    # df = df[df.dwc_n > -2.9999]
+    results = []
+    df['scaled_ret'] = df[weight_col] * df[ret_col]
+    df['hit'] = df[ret_col] > 0  # for calculating hit rate
+    for rank in [x + '_r' for x in signals]:
+        port_ret = df.groupby([rank, time_col], as_index=False)\
+            .agg({'scaled_ret': 'sum', weight_col: 'sum', 'hit': 'mean'})
+        port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
+
+        # organize result
+        overall = port_ret.groupby(rank, as_index=False).agg({'wgt_ret': ['mean', 'std'], 'hit': ['mean', 'count']}, axis=1)
+        overall.columns = ["_".join(x) if x[1] != '' else x[0] for x in overall.columns.ravel()]
+        overall['t_stat'] = overall.wgt_ret_mean / overall.wgt_ret_std
+        overall = overall.set_index(rank).drop('wgt_ret_std', axis=1)\
+            .rename({'wgt_ret_mean': 'ret', 'hit_mean': 'hit', 'hit_count': 'count'}, axis=1)
+        results.append(overall[['ret', 't_stat', 'hit', 'count']])
 
     return results
 
@@ -233,6 +264,79 @@ def process_crsp_annual(filename,year_end=6):
     return data
 
 
+def process_crsp_new(filename, frequency='Q'):
+    """
+    allow quarterly and month
+    """
+    data = pd.read_feather(filename)
+    data['share'] = data['shrout'] * data['cfacshr'] * 1e3
+    data['price'] = data['prc'].abs() / data['cfacpr']
+    data['cap'] = data.price * data.share / 1e6
+
+    aggs = {'rel': 'prod', 'ticker': 'last', 'cap': 'last', 'siccd': 'last'}  # manual change
+    info_cols = [k for k, v in aggs.items() if v == 'last']  # columns for beginnging quantities
+    exempt = ['ticker']
+    required_cols = ['date', 'permno', 'ret'] + info_cols  # for check
+
+    if frequency == 'Q':
+        time_delta = QuarterEnd
+    elif frequency == 'M':
+        time_delta = MonthEnd
+    else:
+        raise ValueError(f'Unrecognized frequency {frequency}')
+
+    tota_rows = data.shape[0]
+    print(f'Total rows: {tota_rows}')
+    print(f'{data.date.min()} to {data.date.max()}')
+
+    print('Check invalid returns')
+    invalid = data[(data.ret == -66) | (data.ret == -77) | (data.ret == -88) | (data.ret == -99)]
+    print(f'Invalid returns: {invalid.shape[0]}')
+
+    for col in exempt:
+        data[col] = data[col].fillna('Missing')
+
+    print('Check missing')
+    for col in required_cols:
+        count = data[col].isna().sum()
+        print(f'    {col} missing: {count} ({count / tota_rows:.2%})')
+
+    data = data[required_cols].dropna()
+    print(f'Remove NAs: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    data = data[(data.siccd < 6000) | (data.siccd > 6999)]  # remove financial
+    print(f'Remove financials: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+
+    dup = data[['permno', 'date']].duplicated().sum()
+    print(f'Duplicated for key [permno, date]: {dup}')
+
+    data.permno = data.permno.astype(int)
+    data['date'] = pd.to_datetime(data['date'])
+    data['time_idx'] = data.date + time_delta(0)
+
+    # aggregate up to annually
+    data['rel'] = 1 + data.ret
+    data.sort_values(['permno', 'date'], inplace=True)  # so that first cap below is correct
+    data = data.groupby(['permno', 'time_idx'], as_index=False).agg(aggs)
+    data['ret'] = data.rel - 1
+    data.drop('rel', axis=1, inplace=True)
+
+    # join with previous quarter for beginning quantities
+    data['time_idx_p'] = data.time_idx - time_delta(1)
+
+    data = pd.merge(data.drop(info_cols, axis=1), data[['permno', 'time_idx'] + info_cols],
+                    left_on=['permno', 'time_idx_p'], right_on=['permno', 'time_idx'], suffixes=('', '_d'), how='inner')
+    data.drop('time_idx_d', axis=1, inplace=True)
+
+    # get coarser industry classification
+    data.siccd = data.siccd.astype('str').str.zfill(4)
+    data['sic1'] = data.siccd.str[:1]
+    data['sic2'] = data.siccd.str[:2]
+    data.dropna(inplace=True)
+    print(f'{frequency} records: {data.shape[0]}')
+    return data
+
+
 def process_compustat(filename, year_end=12):
     # fund = pd.read_csv(filename, compression='gzip', parse_dates=['datadate'], infer_datetime_format='%Y%m%d',
     #                    dtype={'LPERMNO': 'int'}).rename({'LPERMNO': 'permno', 'datadate': 'date'}, axis=1)
@@ -350,23 +454,33 @@ def process_instruction(df, instruction: str):
     [dest, formula] = [x.strip() for x in instruction.split('=')]
 
 
-def process_compustat_new(fund):
+def process_compustat_new(fund, frequency='M'):
     """
     broad process function for compustat
     """
+    if frequency == 'Q':
+        time_delta = QuarterEnd
+        steps = 4  # used to find previous annual record
+    elif frequency == 'M':
+        time_delta = MonthEnd
+        steps = 12  # used to find previous annual record
+    else:
+        raise ValueError(f'Unrecognized frequency {frequency}')
+
     # dataframe schema
     required = ['at', 'che', 'act', 'lct', 'lt', 'sale']
     defaults = ['dlc', 'dltt', 'ivao', 'ivst', 'oiadp', 'pstk']  # per sloan 2005
     non_zeros = ['at']
-    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'oa', 'dacy', 'dac1', 'dac2', 'dac3']
+    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'oa', 'oa1', 'dacy', 'dac1', 'dac2', 'dac3']
 
     total = fund.shape[0]
     print(f'Total rows: {total}')
     print(f'{fund.date.min()} to {fund.date.max()}')
 
-    # unique permno, fyear
-    fund = fund.sort_values(['permno', 'date'])
-    fund = fund.groupby(['permno', 'fyear'], as_index=False).last()  # use the latest for each fiscal year
+    # unique permno, time idx
+    fund['time_idx'] = fund.date + time_delta(0)
+    fund = fund.sort_values(['permno', 'time_idx'])
+    fund = fund.groupby(['permno', 'time_idx'], as_index=False).last()  # use the latest for each time idx
 
     # handle missing value
     fund.dropna(how='any', subset=required, inplace=True)
@@ -396,11 +510,13 @@ def process_compustat_new(fund):
     # ========== Join ==========
     # assume we always need some items from previous period
     # TODO: automate this previou join step
-    join_keys = ['permno', 'fyear']
-    fund['fyear_p'] = fund.fyear - 1
-    fund = pd.merge(fund, fund, left_on=['permno', 'fyear_p'], right_on=join_keys, suffixes=['', '_p'])
-    # fund.dropna(inplace=True)
-    # print(f'After joining previous: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
+    # a lot of the quantities are based on delta, which is sensitive to time delta between now and the previous record
+    # if the fiscal year end of a company is changed such that there are only 6 month between this end and the last end,
+    # then we shouldn't use this record. Hopefully, we won't discard too much in this way
+    fund['time_idx_p'] = fund.time_idx - time_delta(steps)  # require 12 month apart
+    fund = pd.merge(fund, fund, left_on=['permno', 'time_idx_p'], right_on=['permno', 'time_idx'], suffixes=['', '_p'])
+    # fund.dropna(inplace=True)  # don't drop na here because some cols with missing values are not needed
+    print(f'After joining previous: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
 
     # ========== After Join ==========
     # operating accruals
@@ -410,6 +526,8 @@ def process_compustat_new(fund):
     fund['dstd'] = fund.dlc - fund.dlc_p
     fund['dtp'] = (fund.txp - fund.txp_p).fillna(0)  # set to 0 if missing
     fund['oa'] = (fund.dca - fund.dcash) - (fund.dcl - fund.dstd - fund.dtp) - fund.dp
+    fund['oa1'] = fund.ni - fund.oancf
+    fund.loc[fund.fyear <= 1989, 'oa1'] = fund.loc[fund.fyear <= 1989, 'oa']
 
     # DAC
     fund['dsale'] = fund.sale - fund.sale_p
@@ -427,7 +545,7 @@ def process_compustat_new(fund):
     fund['dfin'] = (fund.fin - fund.fin_p) / fund.avg_at
     fund['tacc'] = fund.dwc + fund.dnco + fund.dfin
 
-    fund = fund[['permno', 'fyear'] + keep].dropna()
+    fund = fund[['permno', 'time_idx'] + keep].dropna()
     print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
     return fund
 
