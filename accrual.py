@@ -57,11 +57,20 @@ def calculate_IC(df, ret_col, time_col, alphas):
     return ic
 
 
-def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10):
+def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10, exempt=None):
     cut_idx = list(range(n_cuts))
     df['equal'] = 1
+
+    if exempt is None:
+        exempt = {}
+    else:
+        exempt = {k: 1 for k in exempt}
+
     for signal in signals:
-        df[signal + '_r'] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
+        if signal in exempt:
+            df[signal + '_r'] = df[signal]
+        else:
+            df[signal + '_r'] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
 
     results = []
     df['scaled_ret'] = df[weight_col] * df[ret_col]
@@ -70,7 +79,7 @@ def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight
         port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
 
         port_ret = port_ret.pivot(index=time_col, columns=rank, values='wgt_ret').reset_index()
-        port_ret['hedged'] = (port_ret[0] - port_ret[9]) / 2  # make sure leverage is 1
+        port_ret['hedged'] = (port_ret.iloc[:, 1] - port_ret.iloc[:, -1]) / 2  # make sure leverage is 1
         port_ret['avg'] = port_ret.hedged.rolling(4, min_periods=4).sum()
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         fig.add_trace(go.Bar(y=port_ret.avg, x=port_ret[time_col], name=rank), secondary_y=False)
@@ -103,16 +112,17 @@ def calculate_excess_returns_by_buckets(df, signals, time_col='year', ret_col='r
     df['hit'] = df[ret_col] > 0  # for calculating hit rate
     for rank in [x + '_r' for x in signals]:
         port_ret = df.groupby([rank, time_col], as_index=False)\
-            .agg({'scaled_ret': 'sum', weight_col: 'sum', 'hit': 'mean'})
+            .agg({'scaled_ret': 'sum', weight_col: 'sum', 'hit': 'mean', ret_col: 'count'})
         port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
 
         # organize result
-        overall = port_ret.groupby(rank, as_index=False).agg({'wgt_ret': ['mean', 'std'], 'hit': ['mean', 'count']}, axis=1)
+        overall = port_ret.groupby(rank, as_index=False)\
+            .agg({'wgt_ret': ['mean', 'std'], 'hit': ['mean', 'count'], ret_col: 'mean'}, axis=1)
         overall.columns = ["_".join(x) if x[1] != '' else x[0] for x in overall.columns.ravel()]
         overall['t_stat'] = overall.wgt_ret_mean / overall.wgt_ret_std
         overall = overall.set_index(rank).drop('wgt_ret_std', axis=1)\
-            .rename({'wgt_ret_mean': 'ret', 'hit_mean': 'hit', 'hit_count': 'count'}, axis=1)
-        results.append(overall[['ret', 't_stat', 'hit', 'count']])
+            .rename({'wgt_ret_mean': 'ret', 'hit_mean': 'hit', 'hit_count': 'count', ret_col + '_mean': 'size'}, axis=1)
+        results.append(overall[['ret', 't_stat', 'hit', 'count', 'size']])
 
     return results
 
