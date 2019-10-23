@@ -1,5 +1,6 @@
 
 import pandas as pd
+import numpy as np
 from pandas.tseries.offsets import MonthEnd, QuarterEnd, YearEnd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -51,29 +52,70 @@ def calculate_IC(df, ret_col, time_col, alphas):
     return ic
 
 
-def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10, exempt=None):
+def calculate_IC_decay(df, signals, reverse=None):
+    df = df.set_index('time_idx')
+    ret_cols = [x for x in df.columns if x.startswith('ret_')]
+    periods = [int(x.replace('ret_', '')) for x in ret_cols]
+
+    if reverse is None:
+        reverse = {}
+    else:
+        reverse = {k: 1 for k in reverse}
+
+    data = {}
+    for signal in signals:
+        sign = 1 if signal in reverse else -1
+        corr = []
+        for col in ret_cols:
+            tmp = df[[signal, col]].dropna().groupby(level=0).corr(method='kendall') * sign
+            corr.append(tmp.groupby(level=0).first()[col].mean())
+        data[signal] = corr
+
+    data['period'] = periods
+    return pd.DataFrame(data).set_index('period')
+
+
+def append_forward_returns(raw, periods):
+    data = raw.dropna(subset=['ret']).copy()
+    wide = data.pivot(index='time_idx', columns='permno', values='ret')
+    wide = wide + 1
+
+    rets = []
+    for period in periods:
+        tmp = wide.rolling(window=period).apply(np.prod, raw=True).shift(-period) - 1
+        tmp = tmp.reset_index().melt(id_vars='time_idx', var_name='permno', value_name='ret_' + str(period)).dropna()
+        tmp.time_idx = pd.to_datetime(tmp.time_idx)
+        rets.append(tmp)
+
+    for ret in rets:
+        data = pd.merge(data, ret, on=['time_idx', 'permno'], how='left')
+    return data.dropna()
+
+
+def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10, reverse=None):
+    df = df.copy()
     cut_idx = list(range(n_cuts))
     df['equal'] = 1
 
-    if exempt is None:
-        exempt = {}
+    if reverse is None:
+        reverse = {}
     else:
-        exempt = {k: 1 for k in exempt}
+        reverse = {k: 1 for k in reverse}
 
     for signal in signals:
-        if signal in exempt:
-            df[signal + '_r'] = df[signal]
-        else:
-            df[signal + '_r'] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
+        df[signal] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
 
     results = []
     df['scaled_ret'] = df[weight_col] * df[ret_col]
-    for rank in [x + '_r' for x in signals]:
+    for rank in signals:
         port_ret = df.groupby([rank, time_col], as_index=False).agg({'scaled_ret': 'sum', weight_col: 'sum'})
         port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
 
         port_ret = port_ret.pivot(index=time_col, columns=rank, values='wgt_ret').reset_index()
-        port_ret['hedged'] = (port_ret.iloc[:, 1] - port_ret.iloc[:, -1]) / 2  # make sure leverage is 1
+        if rank in reverse:
+            port_ret['hedged'] = (port_ret.iloc[:, -1] - port_ret.iloc[:, 1]) / 2  # make sure leverage is 1
+        else:
+            port_ret['hedged'] = (port_ret.iloc[:, 1] - port_ret.iloc[:, -1]) / 2  # make sure leverage is 1
         port_ret['avg'] = port_ret.hedged.rolling(4, min_periods=4).sum()
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         fig.add_trace(go.Bar(y=port_ret.avg, x=port_ret[time_col], name=rank), secondary_y=False)
@@ -84,27 +126,19 @@ def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight
     return results
 
 
-def calculate_excess_returns_by_buckets(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10,
-                                        exempt=None):
+def calculate_returns_by_buckets(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10):
+    df = df.copy()
     cut_idx = list(range(n_cuts))
     df['equal'] = 1
 
     # set up exempt list
-    if exempt is None:
-        exempt = {}
-    else:
-        exempt = {k: 1 for k in exempt}
-
     for signal in signals:
-        if signal in exempt:
-            df[signal + '_r'] = df[signal]
-        else:
-            df[signal + '_r'] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
+        df[signal] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
 
     results = []
     df['scaled_ret'] = df[weight_col] * df[ret_col]
     df['hit'] = df[ret_col] > 0  # for calculating hit rate
-    for rank in [x + '_r' for x in signals]:
+    for rank in signals:
         port_ret = df.groupby([rank, time_col], as_index=False)\
             .agg({'scaled_ret': 'sum', weight_col: 'sum', 'hit': 'mean', ret_col: 'count'})
         port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
