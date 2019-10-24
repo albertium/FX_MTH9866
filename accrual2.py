@@ -4,6 +4,7 @@ import numpy as np
 from pandas.tseries.offsets import MonthEnd, QuarterEnd, YearEnd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.express as px
 import statsmodels.api as sm
 from scipy.stats.mstats import winsorize
 import time
@@ -32,7 +33,6 @@ def neutralize_alphas_and_returns(df, group_by, ret_col, alphas):
     def normalize(x):
         normal = (x - x.mean()) / x.std()
         return normal.clip(-3, 3)
-        # return np.maximum(np.minimum(normal, 3), -3)
 
     df = df.copy()
     # neutralize alphas
@@ -90,6 +90,62 @@ def append_forward_returns(raw, periods):
     for ret in rets:
         data = pd.merge(data, ret, on=['time_idx', 'permno'], how='left')
     return data.dropna()
+
+
+def append_past_returns(raw, periods):
+    data = raw.dropna(subset=['ret']).copy()
+    wide = data.pivot(index='time_idx', columns='permno', values='ret')
+    wide = wide + 1
+
+    rets = []
+    for period in periods:
+        tmp = wide.rolling(window=period).apply(np.prod, raw=True) - 1
+        tmp = tmp.reset_index().melt(id_vars='time_idx', var_name='permno', value_name='prev_ret_' + str(period)).dropna()
+        tmp.time_idx = pd.to_datetime(tmp.time_idx)
+        rets.append(tmp)
+
+    for ret in rets:
+        data = pd.merge(data, ret, on=['time_idx', 'permno'], how='left')
+    return data  # don't drop because we may need to work on other fundamental data too
+
+
+def calculate_nway_sorted_return(df, name, sorts, cuts, long_bucket, short_bucket, ret_col='ret'):
+    df = df.copy()
+
+    # n-way sort
+    keys = ['time_idx']
+    for sort, cut in zip(sorts, cuts):
+        df[sort] = df.groupby(keys, as_index=False)[sort].transform(lambda x: pd.qcut(x, cut, range(cut)))
+        keys.append(sort)
+
+    # calculate returns
+    port_ret = df.groupby(['time_idx'] + sorts, as_index=False)[ret_col].mean()
+    summary = port_ret.groupby(sorts, as_index=False)[ret_col].mean()
+    hedged = port_ret.set_index(sorts).groupby('time_idx')\
+        .apply(lambda x: (x.loc[long_bucket, ret_col] - x.loc[short_bucket, ret_col]) / 2)
+
+    # plot
+    # avg = hedged.rolling(4, min_periods=4).sum()
+    # fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # fig.add_trace(go.Bar(y=avg, x=avg.index, name=name + ' Return'), secondary_y=False)
+    # fig.add_trace(go.Scatter(y=(1 + hedged).cumprod(), x=hedged.index, name=name + ' Equity'), secondary_y=True)
+    # fig.show()
+
+    return {'name': name, 'equity': hedged, 'summary': summary}
+
+
+def plot_comparison(results):
+    dfs = []
+    for res in results:
+        equity = (1 + res['equity']).cumprod()
+        equity.name = 'equity'
+        equity = equity.reset_index()
+        equity['name'] = res['name']
+        dfs.append(equity)
+    data = pd.concat(dfs, axis=0)
+
+    fig = px.line(data, x='time_idx', y='equity', color='name')
+    fig.show()
 
 
 def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10, reverse=None):
@@ -231,7 +287,7 @@ def process_crsp(filename, frequency='Q'):
     data['date'] = pd.to_datetime(data['date'])
     data['time_idx'] = data.date + time_delta(0)
 
-    # aggregate up to annually
+    # aggregate up to quarterly
     data['rel'] = 1 + data.ret
     data.sort_values(['permno', 'date'], inplace=True)  # so that first cap below is correct
     data = data.groupby(['permno', 'time_idx'], as_index=False).agg(aggs)
@@ -263,7 +319,7 @@ def process_compustat(fund):
     required = ['at', 'che', 'act', 'lct', 'lt', 'sale']
     defaults = ['dlc', 'dltt', 'ivao', 'ivst', 'oiadp', 'pstk']  # per sloan 2005
     non_zeros = ['at']
-    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'oa', 'oa1', 'dacy', 'dac1', 'dac2', 'dac3', 'ni', 'oancf', 'at']
+    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'oa', 'dacy', 'dac1', 'dac2', 'dac3']
 
     total = fund.shape[0]
     print(f'Total rows: {total}')
@@ -330,8 +386,6 @@ def process_compustat(fund):
     fund['dstd'] = fund.dlc - lag(fund, 'dlc')
     fund['dtp'] = (fund.txp - lag(fund, 'txp')).fillna(0)  # set to 0 if missing
     fund['oa'] = ((fund.dca - fund.dcash) - (fund.dcl - fund.dstd - fund.dtp) - fund.dp) / lag(fund, 'at')
-    fund['oa1'] = (fund.ni - fund.oancf) / lag(fund, 'at')
-    fund.loc[fund.fyear <= 1989, 'oa1'] = fund.loc[fund.fyear <= 1989, 'oa']
 
     # DAC
     fund['dsale'] = fund.sale - lag(fund, 'sale')
@@ -349,7 +403,7 @@ def process_compustat(fund):
     fund['dfin'] = (fund.fin - lag(fund, 'fin')) / fund.avg_at
     fund['tacc'] = fund.dwc + fund.dnco + fund.dfin
 
-    fund = fund[keep].dropna()
+    fund = fund[keep].dropna().reset_index()
     print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
     return fund
 
@@ -368,4 +422,4 @@ def append_dac(panel):
     print(f'Before join: {panel.shape[0]}')
     df = pd.merge(panel, dac, on=['permno', 'time_idx'], how='inner').dropna()
     print(f'After join: {panel.shape[0]}')
-    return df
+    return df.drop(['dacy', 'dac1', 'dac2', 'dac3'], axis=1)
