@@ -71,6 +71,14 @@ def calculate_IC_decay(df, signals, reverse=None):
     return pd.DataFrame(data).set_index('period')
 
 
+def append_forward_returns2(raw, periods, ret_col='ret'):
+    data = raw.dropna(subset=[ret_col]).copy()
+    data = data.set_index(['permno', 'time_idx']).sort_index()
+    for period in periods:
+        data['ret_' + str(period)] = data.groupby(level=0)[ret_col].shift(-period)
+    return data.dropna()
+
+
 def append_forward_returns(raw, periods):
     data = raw.dropna(subset=['ret']).copy()
     wide = data.pivot(index='time_idx', columns='permno', values='ret')
@@ -350,8 +358,8 @@ def process_crsp(filename, frequency='Q'):
     print(f'Remove NAs: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
 
     data = data[(data.siccd < 6000) | (data.siccd > 6999)]  # remove financial
-    data = data[(data.siccd < 1500) | (data.siccd > 1799)]  # remove construction
-    data = data[data.siccd < 9100]  # remove construction
+    # data = data[(data.siccd < 1500) | (data.siccd > 1799)]  # remove construction
+    # data = data[data.siccd < 9100]  # remove construction
     print(f'Remove industries: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
 
     dup = data[['permno', 'date']].duplicated().sum()
@@ -393,7 +401,7 @@ def process_compustat(fund):
     required = ['at', 'che', 'act', 'lct', 'lt', 'sale']
     defaults = ['dlc', 'dltt', 'ivao', 'ivst', 'oiadp', 'pstk']  # per sloan 2005
     non_zeros = ['at']
-    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'oa', 'dacy', 'dac1', 'dac2', 'dac3']
+    keep = ['dwc', 'dnco', 'dnoa', 'dfin', 'tacc', 'tacc2', 'oa', 'dacy', 'dac1', 'dac2', 'dac3']
 
     total = fund.shape[0]
     print(f'Total rows: {total}')
@@ -462,29 +470,30 @@ def process_compustat(fund):
     fund['oa'] = ((fund.dca - fund.dcash) - (fund.dcl - fund.dstd - fund.dtp) - fund.dp) / lag(fund, 'at')
 
     # DAC
+    fund['avg_at'] = (fund['at'] + lag(fund, 'at')) / 2
     fund['dsale'] = fund.sale - lag(fund, 'sale')
     fund['drec'] = fund.rect - lag(fund, 'rect')
-    fund['dacy'] = fund.oa / lag(fund, 'at')
-    fund['dac1'] = 1 / lag(fund, 'at')
-    fund['dac2'] = (fund.dsale - fund.drec) / lag(fund, 'at')
-    fund['dac3'] = fund.ppegt / lag(fund, 'at')
+    fund['dacy'] = fund.oa / fund.avg_at
+    fund['dac1'] = 1 / fund.avg_at
+    fund['dac2'] = (fund.dsale - fund.drec) / fund.avg_at
+    fund['dac3'] = fund.ppegt / fund.avg_at
 
     # extended defintion of accruals
-    fund['avg_at'] = (fund['at'] + lag(fund, 'at')) / 2
     fund['dwc'] = (fund.wc - lag(fund, 'wc')) / fund.avg_at
     fund['dnco'] = (fund.nco - lag(fund, 'nco')) / fund.avg_at
     fund['dnoa'] = fund.dwc + fund.dnco
     fund['dfin'] = (fund.fin - lag(fund, 'fin')) / fund.avg_at
     fund['tacc'] = fund.dwc + fund.dnco + fund.dfin
+    fund['tacc2'] = fund.dwc + fund.dnco - fund.dfin
 
     fund = fund[keep].dropna().reset_index()
     print(f'Final rows: {fund.shape[0]} ({fund.shape[0] / total:.2%})')
     return fund
 
 
-def append_dac(panel):
+def append_dac(panel, ind_col='industry'):
     dac = []
-    for (t, s), data in panel.groupby(['time_idx', 'sic2']):
+    for (t, s), data in panel.groupby(['time_idx', ind_col]):
         data = data[['permno', 'dacy', 'dac1', 'dac2', 'dac3']].dropna()
         if not data.empty:
             res = sm.OLS(data.dacy, data[['dac1', 'dac2', 'dac3']]).fit().resid
