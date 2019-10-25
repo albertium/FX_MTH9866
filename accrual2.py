@@ -29,19 +29,15 @@ def lag(df, col, lag=12):
     return df.groupby(level=0)[col].shift(lag)
 
 
-def neutralize_alphas_and_returns(df, group_by, ret_col, alphas):
+def neutralize_factors(df, group_by, factors):
+    df = df.copy()
+
     def normalize(x):
         normal = (x - x.mean()) / x.std()
         return normal.clip(-3, 3)
 
-    df = df.copy()
     # neutralize alphas
-    df[alphas] = df.groupby(group_by, as_index=False)[alphas].transform(normalize)
-
-    # neutralize returns
-    df = df.set_index(group_by + ['permno'])
-    mean = df.groupby(level=list(range(len(group_by))))[ret_col].mean()
-    df['adj_ret'] = df[ret_col] - mean
+    df[factors] = df.groupby(group_by, as_index=False)[factors].transform(normalize)
     return df.dropna().reset_index()
 
 
@@ -119,17 +115,93 @@ def calculate_nway_sorted_return(df, name, sorts, cuts, long_bucket, short_bucke
         keys.append(sort)
 
     # calculate returns
-    port_ret = df.groupby(['time_idx'] + sorts, as_index=False)[ret_col].mean()
-    summary = port_ret.groupby(sorts, as_index=False)[ret_col].mean()
+    port_ret = df.groupby(['time_idx'] + sorts, as_index=False).agg({ret_col: 'mean', 'permno': 'count'})
+    summary = port_ret.groupby(sorts, as_index=False)[[ret_col, 'permno']].mean()
+    summary = summary.rename({ret_col: 'return', 'permno': 'avg count'}, axis=1)
     hedged = port_ret.set_index(sorts).groupby('time_idx')\
         .apply(lambda x: (x.loc[long_bucket, ret_col] - x.loc[short_bucket, ret_col]) / 2)
 
     # plot
-    # avg = hedged.rolling(4, min_periods=4).sum()
-    # fig = make_subplots(specs=[[{"secondary_y": True}]])
-    # fig.add_trace(go.Bar(y=avg, x=avg.index, name=name + ' Return'), secondary_y=False)
-    # fig.add_trace(go.Scatter(y=(1 + hedged).cumprod(), x=hedged.index, name=name + ' Equity'), secondary_y=True)
-    # fig.show()
+    avg = hedged.rolling(4, min_periods=4).sum()
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(y=avg, x=avg.index, name=name + ' Return'), secondary_y=False)
+    fig.add_trace(go.Scatter(y=(1 + hedged).cumprod(), x=hedged.index, name=name + ' Equity'), secondary_y=True)
+    fig.show()
+
+    return {'name': name, 'equity': hedged, 'summary': summary}
+
+
+def calculate_hedeged_return_by_industry(df, factor, long, short, ind_col='sic1', ret_col='ret_1', ncuts=3):
+    df = df.copy()
+
+    # sorting
+    df[factor] = df.groupby(['time_idx', ind_col], as_index=False)[factor].transform(lambda x: pd.qcut(x, ncuts, range(ncuts)))
+
+    # calculate bucket returns
+    port_ret = df.groupby(['time_idx', ind_col, factor], as_index=False).agg({ret_col: 'mean', 'permno': 'count'})
+    summary = port_ret.set_index(factor).groupby(['time_idx', ind_col], as_index=False).apply(
+        lambda x: pd.Series([
+            (x.loc[long, ret_col] - x.loc[short, ret_col]) / 2,
+            (x.loc[long, 'permno'] + x.loc[short, 'permno'])
+        ], index=['ret', 'count'])
+    )
+
+    summary = summary.groupby(level=1).agg({'ret': ['mean', 'std'], 'count': 'mean'})
+    summary.columns = ["_".join(x) if x[1] != '' else x[0] for x in summary.columns.ravel()]
+    summary['t stat'] = summary.ret_mean / summary.ret_std
+    summary = summary.rename({'ret_mean': 'return', 'count_mean': 'avg count'}, axis=1).drop('ret_std', axis=1)
+    return summary.reset_index()[[ind_col, 'return', 't stat', 'avg count']]
+
+
+def calculate_industry_neutral_nway_return(df, name, sorts, cuts, long_bucket, short_bucket, ind_col='sic1', ret_col='ret'):
+    df = df.copy()
+
+    # n-way sort
+    keys = ['time_idx', ind_col]
+    for sort, cut in zip(sorts, cuts):
+        df[sort] = df.groupby(keys, as_index=False)[sort].transform(lambda x: pd.qcut(x, cut, range(cut)))
+        keys.append(sort)
+
+    # calculate bucket returns
+    port_ret = df.groupby(['time_idx', ind_col] + sorts, as_index=False).agg({ret_col: 'mean', 'permno': 'count'})
+    summary = port_ret.groupby(['time_idx'] + sorts, as_index=False)[[ret_col, 'permno']].apply(
+        lambda x: pd.Series([np.average(x[ret_col], weights=x.permno), x.permno.sum()], index=['ret', 'avg count'])
+    )
+
+    hedged_bucket = summary.reset_index('time_idx').groupby('time_idx').apply(
+        lambda x: pd.Series([
+            (x.loc[long_bucket, 'ret'] - x.loc[short_bucket, 'ret']) / 2,
+            (x.loc[long_bucket, 'avg count'] + x.loc[short_bucket, 'avg count']) / 2
+        ], index=['ret', 'avg count'])
+    )
+    tmp = hedged_bucket.agg({'ret': ['mean', 'std'], 'avg count': 'mean'})
+    hedged_bucket = pd.DataFrame({**{sorts[0]: ['hedged'],
+                                     'return': [tmp.loc['mean', 'ret']],
+                                     't stat': [tmp.loc['mean', 'ret'] / tmp.loc['std', 'ret']],
+                                     'avg count': [tmp.loc['mean', 'avg count']]}, **{x: '' for x in sorts[1:]}})
+
+    summary = summary.groupby(sorts).agg({'ret': ['mean', 'std'], 'avg count': 'mean'}, axis=1)
+    summary.columns = ["_".join(x) if x[1] != '' else x[0] for x in summary.columns.ravel()]
+    summary['t stat'] = summary.ret_mean / summary.ret_std
+    summary = summary.drop('ret_std', axis=1).rename({'ret_mean': 'return', 'avg count_mean': 'avg count'}, axis=1)
+    summary = summary.reset_index()[sorts + ['return', 't stat', 'avg count']]
+    summary = pd.concat([summary, hedged_bucket], axis=0, sort=False)
+
+    # calculate hedged returns
+    hedged = port_ret.set_index(sorts).groupby(['time_idx', ind_col]).apply(
+        lambda x: pd.Series([
+            (x.loc[long_bucket, ret_col] - x.loc[short_bucket, ret_col]) / 2,
+            (x.loc[long_bucket, 'permno'] + x.loc[short_bucket, 'permno']) / 2
+        ], index=['ret', 'count'])
+    )
+    hedged = hedged.groupby(level=0).apply(lambda x: np.average(x.ret, weights=x['count']))
+
+    # plot
+    avg = hedged.rolling(4, min_periods=4).sum()
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(y=avg, x=avg.index, name=name + ' Return'), secondary_y=False)
+    fig.add_trace(go.Scatter(y=(1 + hedged).cumprod(), x=hedged.index, name=name + ' Equity'), secondary_y=True)
+    fig.show()
 
     return {'name': name, 'equity': hedged, 'summary': summary}
 
@@ -278,7 +350,9 @@ def process_crsp(filename, frequency='Q'):
     print(f'Remove NAs: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
 
     data = data[(data.siccd < 6000) | (data.siccd > 6999)]  # remove financial
-    print(f'Remove financials: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
+    data = data[(data.siccd < 1500) | (data.siccd > 1799)]  # remove construction
+    data = data[data.siccd < 9100]  # remove construction
+    print(f'Remove industries: {data.shape[0]} ({data.shape[0] / tota_rows:.2%})')
 
     dup = data[['permno', 'date']].duplicated().sum()
     print(f'Duplicated for key [permno, date]: {dup}')
