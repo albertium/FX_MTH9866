@@ -15,6 +15,9 @@ def df_range(df, start_date, end_date):
 
 
 def df_semi_minus(df1, df2, left, right=None):
+    """
+    difference of two dataframe by keys
+    """
     if right is None:
         right = left
 
@@ -29,19 +32,10 @@ def lag(df, col, lag=12):
     return df.groupby(level=0)[col].shift(lag)
 
 
-def neutralize_factors(df, group_by, factors):
-    df = df.copy()
-
-    def normalize(x):
-        normal = (x - x.mean()) / x.std()
-        return normal.clip(-3, 3)
-
-    # neutralize alphas
-    df[factors] = df.groupby(group_by, as_index=False)[factors].transform(normalize)
-    return df.dropna().reset_index()
-
-
 def calculate_IC(df, ret_col, time_col, alphas):
+    """
+    calculate information coefficient
+    """
     skip = len(alphas) + 1
     ic = df.groupby(time_col)[alphas + [ret_col]].corr(method='kendall').iloc[(skip - 1)::skip]
     ic = ic.reset_index().drop(['level_1', ret_col], axis=1)
@@ -49,6 +43,9 @@ def calculate_IC(df, ret_col, time_col, alphas):
 
 
 def calculate_IC_decay(df, signals, reverse=None):
+    """
+    calculate information coefficient decay
+    """
     df = df.set_index('time_idx')
     ret_cols = [x for x in df.columns if x.startswith('ret_')]
     periods = [int(x.replace('ret_', '')) for x in ret_cols]
@@ -71,7 +68,10 @@ def calculate_IC_decay(df, signals, reverse=None):
     return pd.DataFrame(data).set_index('period')
 
 
-def append_forward_returns2(raw, periods, ret_col='ret'):
+def append_forward_returns(raw, periods, ret_col='ret'):
+    """
+    append forward loocking returns. For the use of IC decay
+    """
     data = raw.dropna(subset=[ret_col]).copy()
     data = data.set_index(['permno', 'time_idx']).sort_index()
     for period in periods:
@@ -79,24 +79,10 @@ def append_forward_returns2(raw, periods, ret_col='ret'):
     return data.dropna()
 
 
-def append_forward_returns(raw, periods):
-    data = raw.dropna(subset=['ret']).copy()
-    wide = data.pivot(index='time_idx', columns='permno', values='ret')
-    wide = wide + 1
-
-    rets = []
-    for period in periods:
-        tmp = wide.rolling(window=period).apply(np.prod, raw=True).shift(-period) - 1
-        tmp = tmp.reset_index().melt(id_vars='time_idx', var_name='permno', value_name='ret_' + str(period)).dropna()
-        tmp.time_idx = pd.to_datetime(tmp.time_idx)
-        rets.append(tmp)
-
-    for ret in rets:
-        data = pd.merge(data, ret, on=['time_idx', 'permno'], how='left')
-    return data.dropna()
-
-
 def append_past_returns(raw, periods):
+    """
+    append past return. For the use of momentum / priced effect
+    """
     data = raw.dropna(subset=['ret']).copy()
     wide = data.pivot(index='time_idx', columns='permno', values='ret')
     wide = wide + 1
@@ -113,33 +99,10 @@ def append_past_returns(raw, periods):
     return data  # don't drop because we may need to work on other fundamental data too
 
 
-def calculate_nway_sorted_return(df, name, sorts, cuts, long_bucket, short_bucket, ret_col='ret'):
-    df = df.copy()
-
-    # n-way sort
-    keys = ['time_idx']
-    for sort, cut in zip(sorts, cuts):
-        df[sort] = df.groupby(keys, as_index=False)[sort].transform(lambda x: pd.qcut(x, cut, range(cut)))
-        keys.append(sort)
-
-    # calculate returns
-    port_ret = df.groupby(['time_idx'] + sorts, as_index=False).agg({ret_col: 'mean', 'permno': 'count'})
-    summary = port_ret.groupby(sorts, as_index=False)[[ret_col, 'permno']].mean()
-    summary = summary.rename({ret_col: 'return', 'permno': 'avg count'}, axis=1)
-    hedged = port_ret.set_index(sorts).groupby('time_idx')\
-        .apply(lambda x: (x.loc[long_bucket, ret_col] - x.loc[short_bucket, ret_col]) / 2)
-
-    # plot
-    avg = hedged.rolling(4, min_periods=4).sum()
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(y=avg, x=avg.index, name=name + ' Return'), secondary_y=False)
-    fig.add_trace(go.Scatter(y=(1 + hedged).cumprod(), x=hedged.index, name=name + ' Equity'), secondary_y=True)
-    fig.show()
-
-    return {'name': name, 'equity': hedged, 'summary': summary}
-
-
 def calculate_hedeged_return_by_industry(df, factor, long, short, ind_col='sic1', ret_col='ret_1', ncuts=3):
+    """
+    hedged return per sector, long 50% short 50%. for sector analysis
+    """
     df = df.copy()
 
     # sorting
@@ -162,6 +125,19 @@ def calculate_hedeged_return_by_industry(df, factor, long, short, ind_col='sic1'
 
 
 def calculate_industry_neutral_nway_return(df, name, sorts, cuts, long_bucket, short_bucket, ind_col='sic1', ret_col='ret'):
+    """
+    calculate long short return controlled for sector (or size)
+
+    :param df: input dataframe
+    :param name: factor name, just for naming the output
+    :param sorts: factors to be sorted. The nth factor will be sorted such that it's independent of the first n-1 factors
+    :param cuts: number of buckets of each sorts
+    :param long_bucket: bucket to long
+    :param short_bucket: bucket to short
+    :param ind_col: controlling variable, like sector or size bucket
+    :param ret_col: forward looking return column
+    :return: structure of equity curve and related statistics
+    """
     df = df.copy()
 
     # n-way sort
@@ -196,25 +172,35 @@ def calculate_industry_neutral_nway_return(df, name, sorts, cuts, long_bucket, s
     summary = pd.concat([summary, hedged_bucket], axis=0, sort=False)
 
     # calculate hedged returns
-    hedged = port_ret.set_index(sorts).groupby(['time_idx', ind_col]).apply(
+    agg = port_ret.set_index(sorts).groupby(['time_idx', ind_col]).apply(
         lambda x: pd.Series([
-            (x.loc[long_bucket, ret_col] - x.loc[short_bucket, ret_col]) / 2,
+            (x.loc[long_bucket, ret_col] - x.loc[short_bucket, ret_col]) / 2,  # to maintain unit leverage
+            (x.loc[long_bucket, ret_col]) / 2,  # division by 2 to match same leverage of the long side
+            (x.loc[short_bucket, ret_col]) / 2,  # division by 2 to match same leverage of the short side
             (x.loc[long_bucket, 'permno'] + x.loc[short_bucket, 'permno']) / 2
-        ], index=['ret', 'count'])
+        ], index=['ret', 'long_ret', 'short_ret', 'count'])
     )
-    hedged = hedged.groupby(level=0).apply(lambda x: np.average(x.ret, weights=x['count']))
+    hedged = agg.groupby(level=0).apply(lambda x: np.average(x.ret, weights=x['count']))
+    long = agg.groupby(level=0).apply(lambda x: np.average(x.long_ret, weights=x['count']))
+    short = agg.groupby(level=0).apply(lambda x: np.average(x.short_ret, weights=x['count']))
 
     # plot
     avg = hedged.rolling(4, min_periods=4).sum()
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(y=avg, x=avg.index, name=name + ' Return'), secondary_y=False)
     fig.add_trace(go.Scatter(y=(1 + hedged).cumprod(), x=hedged.index, name=name + ' Equity'), secondary_y=True)
+    fig.add_trace(go.Scatter(y=(1 + long).cumprod(), x=hedged.index, name=name + ' Long Equity'), secondary_y=True)
+    fig.add_trace(go.Scatter(y=(1 + short).cumprod(), x=hedged.index, name=name + ' Short Equity'), secondary_y=True)
     fig.show()
 
-    return {'name': name, 'equity': hedged, 'summary': summary}
+    return {'name': name, 'equity': hedged, 'summary': summary, 'data': df}
 
 
 def plot_comparison(results):
+    """
+    plot multiple equity curve
+    :param results: output from function "calculate_industry_neutral_nway_return"
+    """
     dfs = []
     for res in results:
         equity = (1 + res['equity']).cumprod()
@@ -228,70 +214,10 @@ def plot_comparison(results):
     fig.show()
 
 
-def calculate_sorted_returns(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10, reverse=None):
-    df = df.copy()
-    cut_idx = list(range(n_cuts))
-    df['equal'] = 1
-
-    if reverse is None:
-        reverse = {}
-    else:
-        reverse = {k: 1 for k in reverse}
-
-    for signal in signals:
-        df[signal] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
-
-    results = []
-    df['scaled_ret'] = df[weight_col] * df[ret_col]
-    for rank in signals:
-        port_ret = df.groupby([rank, time_col], as_index=False).agg({'scaled_ret': 'sum', weight_col: 'sum'})
-        port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
-
-        port_ret = port_ret.pivot(index=time_col, columns=rank, values='wgt_ret').reset_index()
-        if rank in reverse:
-            port_ret['hedged'] = (port_ret.iloc[:, -1] - port_ret.iloc[:, 1]) / 2  # make sure leverage is 1
-        else:
-            port_ret['hedged'] = (port_ret.iloc[:, 1] - port_ret.iloc[:, -1]) / 2  # make sure leverage is 1
-        port_ret['avg'] = port_ret.hedged.rolling(4, min_periods=4).sum()
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(y=port_ret.avg, x=port_ret[time_col], name=rank), secondary_y=False)
-        fig.add_trace(go.Scatter(y=(1 + port_ret.hedged).cumprod(), x=port_ret[time_col], name='Equity'), secondary_y=True)
-        fig.show()
-        results.append(port_ret)
-
-    return results
-
-
-def calculate_returns_by_buckets(df, signals, time_col='year', ret_col='ret', weight_col='cap', n_cuts=10):
-    df = df.copy()
-    cut_idx = list(range(n_cuts))
-    df['equal'] = 1
-
-    # set up exempt list
-    for signal in signals:
-        df[signal] = df.groupby(time_col, as_index=False)[signal].transform(lambda x: pd.qcut(x, n_cuts, cut_idx))
-
-    results = []
-    df['scaled_ret'] = df[weight_col] * df[ret_col]
-    df['hit'] = df[ret_col] > 0  # for calculating hit rate
-    for rank in signals:
-        port_ret = df.groupby([rank, time_col], as_index=False)\
-            .agg({'scaled_ret': 'sum', weight_col: 'sum', 'hit': 'mean', ret_col: 'count'})
-        port_ret['wgt_ret'] = port_ret.scaled_ret / port_ret[weight_col]
-
-        # organize result
-        overall = port_ret.groupby(rank, as_index=False)\
-            .agg({'wgt_ret': ['mean', 'std'], 'hit': ['mean', 'count'], ret_col: 'mean'}, axis=1)
-        overall.columns = ["_".join(x) if x[1] != '' else x[0] for x in overall.columns.ravel()]
-        overall['t_stat'] = overall.wgt_ret_mean / overall.wgt_ret_std
-        overall = overall.set_index(rank).drop('wgt_ret_std', axis=1)\
-            .rename({'wgt_ret_mean': 'ret', 'hit_mean': 'hit', 'hit_count': 'count', ret_col + '_mean': 'size'}, axis=1)
-        results.append(overall[['ret', 't_stat', 'hit', 'count', 'size']])
-
-    return results
-
-
 def get_funda_data(conn, items):
+    """
+    download Compustat data from WRDS
+    """
     comp = conn.raw_sql(f"""
         select gvkey, datadate as date, fyear, cusip, sich, seq, 
         {items}
@@ -323,7 +249,7 @@ def get_funda_data(conn, items):
 
 def process_crsp(filename, frequency='Q'):
     """
-    allow quarterly and month
+    preprocessing steps for CRSP dataset
     """
     data = pd.read_feather(filename)
     data['share'] = data['shrout'] * data['cfacshr'] * 1e3
@@ -395,7 +321,7 @@ def process_crsp(filename, frequency='Q'):
 
 def process_compustat(fund):
     """
-    broad process function for compustat
+    preprocessing step for compustat, including factor generation
     """
     # dataframe schema
     required = ['at', 'che', 'act', 'lct', 'lt', 'sale']
@@ -492,6 +418,9 @@ def process_compustat(fund):
 
 
 def append_dac(panel, ind_col='industry'):
+    """
+    calculate discretionary accrual
+    """
     dac = []
     for (t, s), data in panel.groupby(['time_idx', ind_col]):
         data = data[['permno', 'dacy', 'dac1', 'dac2', 'dac3']].dropna()
