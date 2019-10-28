@@ -91,6 +91,7 @@ def append_past_returns(raw, periods):
     for period in periods:
         tmp = wide.rolling(window=period).apply(np.prod, raw=True) - 1
         tmp = tmp.reset_index().melt(id_vars='time_idx', var_name='permno', value_name='prev_ret_' + str(period)).dropna()
+        tmp.permno = tmp.permno.astype('int')
         tmp.time_idx = pd.to_datetime(tmp.time_idx)
         rets.append(tmp)
 
